@@ -386,8 +386,10 @@ class MossRealtimeReferenceEncoder(MossReferenceEncoder):
     """Use the realtime codec with the shared reference cache and batcher."""
 
     def _encode_prepared(self, prepared: list[torch.Tensor]) -> list[torch.Tensor]:
+        parameter = next(self._processor.parameters())
+        waveforms = [wav.squeeze(0).to(device=parameter.device, dtype=parameter.dtype) for wav in prepared]
         with torch.no_grad():
-            encoded = self._processor.batch_encode([wav.squeeze(0) for wav in prepared], num_quantizers=self._n_vq)
+            encoded = self._processor.batch_encode(waveforms, num_quantizers=self._n_vq)
         return [
             encoded.audio_codes[:, i, : int(length.item())].transpose(0, 1).contiguous()
             for i, length in enumerate(encoded.audio_codes_lengths)
