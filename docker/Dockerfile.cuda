@@ -17,6 +17,13 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && VLLM_OMNI_VERSION_OVERRIDE=0.30.0 uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
 
+# Wheel installation may omit non-Python deployment resources.
+# Copy the full deploy tree, preserving relative includes, into the installed package.
+RUN python3 -c 'import importlib.util, pathlib, shutil; src=pathlib.Path("/app/vllm-omni/vllm_omni/deploy"); dst=pathlib.Path(importlib.util.find_spec("vllm_omni").origin).parent / "deploy"; assert (src / "moss_tts_realtime.yaml").is_file(), src; shutil.copytree(src, dst, dirs_exist_ok=True)'
+
+# Validate the installed resources from outside the source tree (no GPU required).
+RUN cd /tmp && python3 -c 'import importlib.util, pathlib; from omegaconf import OmegaConf; root=pathlib.Path(importlib.util.find_spec("vllm_omni").origin).parent; p=root / "deploy/moss_tts_realtime.yaml"; assert p.is_file(), p; cfg=OmegaConf.load(p); assert [s.stage_id for s in cfg.stages] == [0, 1]; assert cfg.connectors.shm.name == "SharedMemoryConnector"; print("MOSS-TTS deployment config OK:", p)'
+
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []
