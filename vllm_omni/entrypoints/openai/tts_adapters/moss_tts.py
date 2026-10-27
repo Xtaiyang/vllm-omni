@@ -127,11 +127,18 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         """Sub-classify a ``moss_tts``-stage server into the actual MOSS-TTS
         variant family (tts, ttsd, sound_effect, voice_generator, realtime).
 
-        Detection key is the HF repo path / model_name; matches
+        Prefer explicit checkpoint metadata for Realtime: local model mounts
+        such as /models/main do not preserve the Hugging Face repository name.
+        For other variants, the fallback is the HF repo path / model_name; matches
         ``_try_resolve_omni_model_type`` in entrypoints/utils.py so users get
         consistent behaviour no matter how they launched the server (--model
         OpenMOSS-Team/MOSS-TTSD-v1.0 vs --deploy-config moss_ttsd.yaml).
         """
+        hf_config = getattr(self.engine_client.model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) == "moss_tts_realtime":
+            return "realtime"
+        if "MossTTSRealtime" in (getattr(hf_config, "architectures", None) or []):
+            return "realtime"
         try:
             name = (self.engine_client.model_config.model or "").lower().replace("-", "").replace("_", "")
         except Exception:
