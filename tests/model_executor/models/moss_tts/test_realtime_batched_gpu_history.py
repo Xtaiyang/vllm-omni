@@ -71,6 +71,20 @@ def test_row_local_penalty_padding_duplicates_and_sign(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("penalty", [1.0, 1.1, 2.0])
+def test_repetition_penalty_keeps_zero_logits_neutral(device, penalty):
+    logits = torch.tensor([[0.0, -0.0, 2.0, -3.0]], device=device)
+    # Repeated zero-valued tokens must stay neutral without changing other
+    # logits or mutating the caller's tensor.
+    history = torch.tensor([[0, 0, 1, 1, -1]], device=device)
+    expected = logits.clone()
+    actual = PENALTY(logits, history, penalty)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(torch.signbit(actual), torch.signbit(expected))
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_real_generate_frame_batches_like_independent_greedy_rows(device):
     torch.manual_seed(7)
     nq, hidden_size, vocab = 4, 8, 12

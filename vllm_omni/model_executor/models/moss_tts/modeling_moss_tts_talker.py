@@ -1175,6 +1175,8 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     if ch0 == self.AUDIO_EOS:
                         state["is_stopping"] = True
                     if ch0 in (self.AUDIO_EOS, self.AUDIO_BOS, self.audio_pad_token):
+                        # compute_logits turns is_stopping into text EOS; the
+                        # connector flushes via finished metadata, not codec controls.
                         info["audio_codes"] = {"current": new_codes, "accumulated": None, "history": history}
                         state["history_cursor"] = cursor
                         continue

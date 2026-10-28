@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from .test_realtime_batched_gpu_history import DEVICES, GENERATE
+from .test_realtime_batched_gpu_history import DEVICES, GENERATE, load_functions
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -127,3 +127,51 @@ def test_realtime_seed_transport_sources(device, seed_source):
     torch.testing.assert_close(
         result.multimodal_outputs["codes"]["audio"][0], expected.multimodal_outputs["codes"]["audio"][0]
     )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("replacement_id", ["original", "replacement"])
+def test_v2_buffer_removal_and_slot_reuse_restart_request_rng(device, replacement_id):
+    """Exercise real buffer lifecycle methods, not a full scheduler/engine."""
+    from .test_realtime_batched_gpu_history import run
+
+    method_names = {"__init__", "add_request", "remove_request"}
+    methods = load_functions(
+        "../../../worker_v2/model_states/intermediate_buffer.py",
+        method_names,
+        "OmniIntermediateBuffer",
+    )
+    buffer_type = type("BufferLifecycle", (), {name: methods[name] for name in method_names})
+    buffer = buffer_type(1)
+
+    def add_request(request_id):
+        buffer.add_request(
+            0,
+            SimpleNamespace(req_id=request_id, mm_features=[], sampling_params=SimpleNamespace(seed=31)),
+        )
+
+    local, heads, hidden = _local_model(device)
+    talker = _talker(local, heads)
+    add_request("original")
+    first = run(talker, hidden[:1], [buffer.buffers[0]]).multimodal_outputs["codes"]["audio"][0].clone()
+    old_generator = buffer.buffers[0]["audio_state"]["local_generator"]
+    first_rng_state = old_generator.get_state().clone()
+    run(talker, hidden[:1], [buffer.buffers[0]])
+    advanced_rng_state = old_generator.get_state().clone()
+    assert not torch.equal(first_rng_state, advanced_rng_state)
+
+    # V2 completion and abort both remove the request-owned buffer before a
+    # scheduler slot (and potentially the same request ID) is reused.
+    buffer.remove_request(0)
+    assert buffer.buffers[0] == {}
+    assert buffer.req_id_to_index == {}
+    add_request(replacement_id)
+    assert buffer.req_id_to_index == {replacement_id: 0}
+    assert "audio_state" not in buffer.buffers[0]
+
+    replay = run(talker, hidden[:1], [buffer.buffers[0]]).multimodal_outputs["codes"]["audio"][0]
+    new_generator = buffer.buffers[0]["audio_state"]["local_generator"]
+    assert new_generator is not old_generator
+    torch.testing.assert_close(replay, first)
+    torch.testing.assert_close(new_generator.get_state(), first_rng_state)
+    torch.testing.assert_close(old_generator.get_state(), advanced_rng_state)
