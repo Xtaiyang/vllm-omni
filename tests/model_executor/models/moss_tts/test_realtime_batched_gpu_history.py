@@ -9,6 +9,7 @@ extensions. Tensor math and routing execute unchanged with real PyTorch.
 from __future__ import annotations
 
 import ast
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -37,12 +38,14 @@ def load_functions(filename, names, class_name=None):
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *funcs],
         type_ignores=[],
     )
-    ns = dict(torch=torch, F=F, OmniOutput=OmniOutput)
+    ns = dict(torch=torch, F=F, OmniOutput=OmniOutput, Sequence=Sequence)
     exec(compile(ast.fix_missing_locations(mod), filename, "exec"), ns)
     return ns
 
 
-LOCAL = load_functions("modeling_moss_tts_local.py", {"_apply_batched_repetition_penalty", "_sample_token"})
+LOCAL = load_functions(
+    "modeling_moss_tts_local.py", {"_apply_batched_repetition_penalty", "_sample_token", "_normalize_generators"}
+)
 PENALTY = LOCAL["_apply_batched_repetition_penalty"]
 MAKE = load_functions("modeling_moss_tts_talker.py", {"make_omni_output"}, "MossTTSRealtimeTalkerForGeneration")[
     "make_omni_output"
@@ -51,7 +54,10 @@ GENERATE_NS = load_functions("modeling_moss_tts_local.py", {"generate_frame"}, "
 GENERATE_NS.update(LOCAL)
 GENERATE = GENERATE_NS["generate_frame"]
 
-DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+DEVICES = ["cpu"] + (
+    ["cuda"] if torch.accelerator.is_available() and torch.accelerator.current_accelerator().type == "cuda" else []
+)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -218,3 +224,39 @@ def test_sixteen_streams_reordered_and_independently_penalized(device):
         expected[row, i + 1] = 0.5
         expected[row, i + 101] = 0.5
     torch.testing.assert_close(penalized, expected)
+
+
+def test_sampling_keeps_main_per_row_generators():
+    sample = LOCAL["_sample_token"]
+    logits = torch.tensor([[1.0, 2.0, 3.0], [3.0, 1.0, 2.0]])
+    gens = [torch.Generator().manual_seed(4), torch.Generator().manual_seed(9)]
+    actual = sample(logits, 1.0, 2, 0.95, True, generators=gens)
+    expected = torch.cat(
+        [
+            sample(logits[i : i + 1], 1.0, 2, 0.95, True, generators=[torch.Generator().manual_seed(seed)])
+            for i, seed in enumerate((4, 9))
+        ]
+    )
+    torch.testing.assert_close(actual, expected)
+    with pytest.raises(ValueError, match="per-row generators"):
+        sample(logits, 1.0, 2, 0.95, True, generators=gens[:1])
+
+
+def test_realtime_reference_encoder_keeps_graphs_signature_and_codec_dtype():
+    encode = load_functions("reference_encoder.py", {"_encode_prepared"}, "MossRealtimeReferenceEncoder")[
+        "_encode_prepared"
+    ]
+
+    class Codec(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float64))
+
+        def batch_encode(self, waveforms, num_quantizers):
+            assert waveforms[0].device == self.weight.device
+            assert waveforms[0].dtype == self.weight.dtype
+            assert waveforms[0].shape == (8,)
+            return SimpleNamespace(audio_codes=torch.ones(num_quantizers, 1, 2), audio_codes_lengths=torch.tensor([2]))
+
+    result = encode(SimpleNamespace(_processor=Codec(), _n_vq=16), [torch.zeros(1, 8)], graphs=None)
+    assert result[0].shape == (2, 16)
