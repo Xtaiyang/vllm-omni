@@ -47,9 +47,9 @@ LOCAL = load_functions(
     "modeling_moss_tts_local.py", {"_apply_batched_repetition_penalty", "_sample_token", "_normalize_generators"}
 )
 PENALTY = LOCAL["_apply_batched_repetition_penalty"]
-MAKE = load_functions("modeling_moss_tts_talker.py", {"make_omni_output"}, "MossTTSRealtimeTalkerForGeneration")[
-    "make_omni_output"
-]
+MAKE_NS = load_functions("modeling_moss_tts_talker.py", {"make_omni_output"}, "MossTTSRealtimeTalkerForGeneration")
+MAKE_NS.update(load_functions("../../../worker/sampling_utils.py", {"get_tts_local_seed"}))
+MAKE = MAKE_NS["make_omni_output"]
 GENERATE_NS = load_functions("modeling_moss_tts_local.py", {"generate_frame"}, "MossTTSRealtimeLocalTransformer")
 GENERATE_NS.update(LOCAL)
 GENERATE = GENERATE_NS["generate_frame"]
@@ -184,6 +184,50 @@ def test_history_ring_wrap_and_legacy_bootstrap(device):
     legacy = {"audio_codes": {"accumulated": torch.arange(60, device=device).view(60, 1).expand(-1, 4)}}
     run(obj, torch.tensor([[60.0]], device=device), [legacy])
     assert sorted(legacy["audio_codes"]["history"][0].tolist()) == list(range(11, 61))
+
+
+@pytest.mark.parametrize("shape", [(12,), (4, 60), (2, 3), (2, 1, 4), (0, 3)])
+def test_legacy_history_rejects_invalid_shape_before_sampling(shape):
+    obj, calls = bare()
+    info = {"audio_codes": {"accumulated": torch.zeros(shape, dtype=torch.long)}}
+    with pytest.raises(ValueError, match=r"accumulated.*\(T, 4\)"):
+        run(obj, torch.ones(1, 1), [info])
+    assert calls == []
+
+
+def test_legacy_empty_history_bootstraps_without_frames():
+    obj, calls = bare()
+    info = {"audio_codes": {"accumulated": torch.empty(0, 4, dtype=torch.long)}}
+    run(obj, torch.ones(1, 1), [info])
+    assert torch.all(calls[0][1] == -1)
+
+
+@pytest.mark.parametrize("code", [7, 1024, 1025, 1026])
+def test_legacy_accumulated_storage_is_released_after_bootstrap(code):
+    obj, calls = bare()
+    old = torch.arange(240).reshape(60, 4)
+    info = {"audio_codes": {"accumulated": old}}
+    run(obj, torch.tensor([[float(code)]]), [info])
+    torch.testing.assert_close(calls[0][1][0], old[-50:].T)
+    assert info["audio_codes"].get("accumulated") is None
+    torch.testing.assert_close(old, torch.arange(240).reshape(60, 4))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_long_stream_state_is_bounded_without_losing_emitted_frames(device):
+    obj, _ = bare(device)
+    infos = [{}, {}]
+    emitted = [[], []]
+    for step in range(130):
+        out = run(obj, torch.tensor([[float(step)], [float(step + 200)]], device=device), infos)
+        for i, info in enumerate(infos):
+            emitted[i].append(out.multimodal_outputs["codes"]["audio"][i])
+            codes = info["audio_codes"]
+            assert codes.get("accumulated") is None
+            assert sum(v.numel() for v in codes.values() if isinstance(v, torch.Tensor)) == 4 * 51
+    for i in range(2):
+        expected = torch.arange(i * 200, i * 200 + 130, device=device).view(-1, 1).expand(-1, 4)
+        torch.testing.assert_close(torch.cat(emitted[i]), expected)
 
 
 def test_no_active_rows_and_generation_limit():
