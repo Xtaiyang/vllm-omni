@@ -873,7 +873,6 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
-            ("audio_codes", "accumulated"),
             ("audio_codes", "history"),
             ("hidden_states", "last"),
         }
@@ -1077,7 +1076,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         # See delay talker: real per-request row spans from the runner are
         # required because mixed prefill+decode steps have unequal row counts.
         spans = kwargs.get("request_token_spans")
-        # Per-request accumulated codes in batch order, pre-filled with empty
+        # Per-request current-frame codes in batch order, pre-filled with empty
         # placeholders so every skip path (stopped / eos / bos / pad) keeps
         # indices aligned for to_payload_element's per-request routing. A
         # shorter list would silently fall back to request 0's codes.
@@ -1094,6 +1093,8 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
             # All request-owned tensors live in that request's intermediate buffer;
             # no slot index or shared history survives batch reorder/cancellation.
             active = []
+            generators: list[torch.Generator | None] = []
+            sampling_params = kwargs.get("request_sampling_params")
             rep_window = 50
             for i, info in enumerate(info_dicts):
                 if not isinstance(info, dict) or not eligible[i]:
@@ -1112,12 +1113,34 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     history = torch.full((self.n_vq, rep_window), -1, dtype=torch.long, device=hidden.device)
                     # Bootstrap old in-flight/request-prefix state without D2H.
                     acc = audio_codes.get("accumulated")
+                    if isinstance(acc, torch.Tensor) and (acc.dim() != 2 or acc.shape[-1] != self.n_vq):
+                        raise ValueError(f"Realtime accumulated audio codes must have shape (T, {self.n_vq})")
                     if isinstance(acc, torch.Tensor) and acc.numel():
                         count = min(rep_window, acc.shape[0])
                         history[:, :count].copy_(acc[-count:].to(device=hidden.device, dtype=torch.long).T)
                         cursor = count % rep_window
                 if history.shape != (self.n_vq, rep_window) or history.device != hidden.device:
                     raise RuntimeError("Invalid request-local realtime audio history")
+                generator = state.get("local_generator")
+                if generator is None:
+                    seed = info.get("seed")
+                    if isinstance(seed, (list, tuple)):
+                        seed = seed[0] if seed else None
+                    params = (
+                        sampling_params[i]
+                        if sampling_params is not None and i < len(sampling_params)
+                        else info.get("sampling_params")
+                    )
+                    if seed is None:
+                        seed = get_tts_local_seed(params)
+                    if seed is None:
+                        seed = getattr(params, "seed", None)
+                    if seed is not None:
+                        # Worker-owned request state survives reorder/resume and
+                        # is released on completion; it is not an output or APC payload.
+                        generator = torch.Generator(device=hidden.device).manual_seed(int(seed))
+                        state["local_generator"] = generator
+                generators.append(generator)
                 active.append((i, info, state, row_end - 1, history, cursor))
 
             if active:
@@ -1134,6 +1157,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     do_sample=True,
                     repetition_penalty=1.1,
                     history_codes=histories,
+                    generators=generators,
                 )
                 if batch_codes.shape != (len(active), self.n_vq):
                     raise RuntimeError("Realtime local transformer returned an invalid batch shape")
@@ -1148,12 +1172,10 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     max_new_frames = int(state.get("max_new_frames", -1))
                     if max_new_frames > 0 and state["step"] >= max_new_frames:
                         state["is_stopping"] = True
-                    audio_codes = info.get("audio_codes", {}) or {}
-                    acc = audio_codes.get("accumulated")
                     if ch0 == self.AUDIO_EOS:
                         state["is_stopping"] = True
                     if ch0 in (self.AUDIO_EOS, self.AUDIO_BOS, self.audio_pad_token):
-                        info["audio_codes"] = {"current": new_codes, "accumulated": acc, "history": history}
+                        info["audio_codes"] = {"current": new_codes, "accumulated": None, "history": history}
                         state["history_cursor"] = cursor
                         continue
                     # Ring history is independent per request and stays on GPU.
@@ -1162,11 +1184,10 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     next_history = history.clone()
                     next_history[:, cursor].copy_(new_codes)
                     state["history_cursor"] = (cursor + 1) % rep_window
-                    if isinstance(acc, torch.Tensor) and acc.numel() > 0:
-                        updated_acc = torch.cat([acc.to(new_codes.device), new_codes.unsqueeze(0)], dim=0)
-                    else:
-                        updated_acc = new_codes.unsqueeze(0)
-                    info["audio_codes"] = {"current": new_codes, "accumulated": updated_acc, "history": next_history}
+                    # Stage 1 buffers emitted codes.audio deltas independently.
+                    # Clear legacy full history (also through nested buffer merges);
+                    # only the bounded penalty ring is needed by the talker.
+                    info["audio_codes"] = {"current": new_codes, "accumulated": None, "history": next_history}
                     per_req_codes[i] = new_codes.unsqueeze(0)
                     have_codes = True
 
