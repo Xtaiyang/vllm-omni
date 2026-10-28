@@ -15,33 +15,7 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
 # Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
-RUN cd ${COMMON_WORKDIR}/vllm-omni && VLLM_OMNI_TARGET_DEVICE=cuda VLLM_OMNI_VERSION_OVERRIDE=0.30.0 uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
-
-# Wheel installation may omit non-Python deployment resources.
-# Copy the full deploy tree, preserving relative includes, into the installed package.
-RUN python3 -c 'import importlib.util, pathlib, shutil; src=pathlib.Path("/app/vllm-omni/vllm_omni/deploy"); dst=pathlib.Path(importlib.util.find_spec("vllm_omni").origin).parent / "deploy"; assert (src / "moss_tts_realtime.yaml").is_file(), src; shutil.copytree(src, dst, dirs_exist_ok=True)'
-
-# Validate the installed resources from outside the source tree (no GPU required).
-RUN cd /tmp && python3 -c 'import importlib.util, pathlib; from omegaconf import OmegaConf; root=pathlib.Path(importlib.util.find_spec("vllm_omni").origin).parent; p=root / "deploy/moss_tts_realtime.yaml"; assert p.is_file(), p; cfg=OmegaConf.load(p); assert [s.stage_id for s in cfg.stages] == [0, 1]; assert cfg.connectors.shm.name == "SharedMemoryConnector"; print("MOSS-TTS deployment config OK:", p)'
-
-# Fail during build for incompatible package metadata or missing audio dependencies.
-# Official vLLM v0.30.0 pins NCCL 2.30.7 for DeepEPv2 (docker/Dockerfile).
-# Preserve that deliberate base-image override; reject every other pip conflict.
-RUN python3 - <<'PY'
-import importlib.metadata as metadata
-import subprocess
-import sys
-result = subprocess.run(["uv", "pip", "check", "--python", sys.executable], capture_output=True, text=True)
-output = result.stdout + result.stderr
-print(output, end="")
-allowed = "The package `torch` requires `nvidia-nccl-cu13==2.29.7 ; sys_platform == 'linux'`, but `2.30.7` is installed"
-issues = [line.strip() for line in output.splitlines() if line.strip().startswith("The package ")]
-if result.returncode:
-    assert result.returncode == 1 and issues == [allowed] and "Found 1 incompatibility" in output, output
-    assert metadata.version("nvidia-nccl-cu13") == "2.30.7"
-    print("Accepted only the documented official vLLM NCCL 2.30.7 override; all other dependency checks passed.")
-PY
-RUN cd /tmp && python3 -c 'import importlib.metadata as m; import torch, torchaudio, transformers, soundfile, safetensors; from vllm_omni.model_executor.models.moss_tts.audio_tokenizer import MossAudioTokenizerConfig, MossAudioTokenizerModel; assert m.version("vllm").split("+")[0] == "0.30.0", m.version("vllm"); assert m.version("vllm-omni").split("+")[0] == "0.30.0", m.version("vllm-omni"); assert torch.version.cuda is not None, "CPU-only torch is not supported"; print({k:m.version(k) for k in ("vllm", "vllm-omni", "torch", "torchaudio", "transformers", "soundfile", "safetensors")}); print("CUDA runtime:", torch.version.cuda)'
+RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
