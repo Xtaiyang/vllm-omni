@@ -208,7 +208,12 @@ def _sample_token(
 
     When ``generators`` is provided (per-row), each row is sampled with its
     own generator via separate ``multinomial`` calls. This keeps the rest of
-    the forward batched while making seeded requests reproducible per-row.
+    the forward batched and isolates each request's RNG progress from other
+    requests. Identical sampled tokens additionally require identical
+    filtered probabilities and candidate ordering: tied top-k values and
+    floating-point rounding near the top-p cutoff can differ across batch
+    shapes, so bitwise equivalence across arbitrary batch compositions is
+    not guaranteed.
     ``generators`` must hold exactly one entry per batch row; a mismatch raises
     ``ValueError`` rather than silently falling back to the global RNG.
     """
