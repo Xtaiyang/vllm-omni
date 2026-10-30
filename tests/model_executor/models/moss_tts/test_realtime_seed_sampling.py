@@ -3,6 +3,7 @@
 """Weight-free regression of seeded sampling through the real frame method."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -86,9 +87,24 @@ def test_realtime_seeded_request_chain_reorder_cancel_and_new_request(device):
     from .test_realtime_batched_gpu_history import run
 
     local, heads, hidden = _local_model(device)
+
+    class FixedLogitsHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("logits", -(torch.arange(32, dtype=torch.float32) + 0.5) / 8)
+
+        def forward(self, hidden):
+            return self.logits.expand(*hidden.shape[:-1], -1)
+
+    # The talker uses top_k=30/top_p=0.6. Uniform logits put the 18th
+    # cumulative probability exactly on the cutoff, where different CUDA
+    # scan orders can select different nuclei. Use fixed, tie-free logits
+    # away from that boundary to isolate request RNG ownership. The direct
+    # frame test above still covers uniform logits without nucleus filtering.
+    heads = torch.nn.ModuleList([FixedLogitsHead() for _ in heads]).to(device)
     talker = _talker(local, heads)
-    infos = {key: {"seed": [seed]} for key, seed in zip("abcd", (7, 11, 23, 7))}
-    singles = {key: {"seed": [seed]} for key, seed in zip("abcd", (7, 11, 23, 7))}
+    infos: dict[str, dict[str, Any]] = {key: {"seed": [seed]} for key, seed in zip("abcd", (7, 11, 23, 7))}
+    singles: dict[str, dict[str, Any]] = {key: {"seed": [seed]} for key, seed in zip("abcd", (7, 11, 23, 7))}
     first_a = None
     # d is a new request reusing a's seed after a was cancelled. It must own a
     # new generator; c/b preserve their RNG positions through changing batches.
@@ -98,6 +114,10 @@ def test_realtime_seeded_request_chain_reorder_cancel_and_new_request(device):
         for row, key in enumerate(keys):
             expected = run(talker, hidden[:1], [singles[key]]).multimodal_outputs["codes"]["audio"][0]
             torch.testing.assert_close(actual[row], expected)
+            torch.testing.assert_close(
+                infos[key]["audio_state"]["local_generator"].get_state(),
+                singles[key]["audio_state"]["local_generator"].get_state(),
+            )
             if key == "a" and first_a is None:
                 first_a = actual[row].clone()
             if key == "d":
@@ -114,7 +134,7 @@ def test_realtime_seed_transport_sources(device, seed_source):
     local, heads, hidden = _local_model(device)
     talker = _talker(local, heads)
     params = SimpleNamespace(seed=None, extra_args={"tts_local_seed": 31})
-    info = {}
+    info: dict[str, Any] = {}
     extra = {}
     if seed_source == "adapter":
         info["seed"] = [31]
